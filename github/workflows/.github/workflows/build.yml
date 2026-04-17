@@ -1,0 +1,51 @@
+name: Build macOS App
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+
+    steps:
+      - name: 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: Python 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 의존성 설치
+        run: |
+          pip install --upgrade pip
+          pip install pyinstaller python-docx pdfplumber
+
+      - name: PyInstaller 빌드
+        run: |
+          pyinstaller \
+            --name "MD Converter" \
+            --onedir \
+            --windowed \
+            --noconfirm \
+            --clean \
+            --hidden-import=pdfplumber \
+            --hidden-import=docx \
+            --hidden-import=pdfminer \
+            --hidden-import=pdfminer.high_level \
+            --hidden-import=pdfminer.layout \
+            converter_app.py
+
+      - name: .app 압축
+        run: |
+          cd dist
+          zip -r "MD-Converter-macOS.zip" "MD Converter.app"
+
+      - name: 아티팩트 업로드
+        uses: actions/upload-artifact@v4
+        with:
+          name: MD-Converter-macOS
+          path: dist/MD-Converter-macOS.zip
+          retention-days: 30
