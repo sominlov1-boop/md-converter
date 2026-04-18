@@ -7,7 +7,7 @@ on:
 
 jobs:
   build-macos:
-    runs-on: macos-13
+    runs-on: macos-15-intel
 
     steps:
       - name: 코드 체크아웃
