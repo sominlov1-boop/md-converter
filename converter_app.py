@@ -93,61 +93,89 @@ def pdf_to_md(path: str) -> str:
 
 
 def hwpx_to_md(path: str) -> str:
-    """HWPX는 ZIP 컨테이너 안에 XML이 들어있는 구조"""
-    lines = []
+    """HWPX는 ZIP 컨테이너 안에 XML. 스타일/개요(outline) 정보로 제목 레벨 판단."""
+    paragraphs = []  # [(level, text)] — level: 0=본문, 1~6=제목
+
     try:
         with zipfile.ZipFile(path, 'r') as z:
-            # 본문 XML 파일들 찾기 (Contents/section*.xml)
+            # 본문 XML들
             xml_files = sorted([n for n in z.namelist()
                                 if n.startswith("Contents/section") and n.endswith(".xml")])
             if not xml_files:
-                # 다른 구조일 경우 모든 xml 시도
                 xml_files = [n for n in z.namelist() if n.endswith(".xml")]
 
-            # HWPX 네임스페이스
-            ns = {
-                "hp": "http://www.hancom.co.kr/hwpml/2011/paragraph",
-                "hs": "http://www.hancom.co.kr/hwpml/2011/section",
-            }
+            # 헤더(스타일 정의) 읽기 — 제목 스타일 ID 매핑
+            style_to_level = {}
+            header_files = [n for n in z.namelist() if "header" in n.lower() and n.endswith(".xml")]
+            for hf in header_files:
+                try:
+                    with z.open(hf) as f:
+                        header_xml = f.read().decode("utf-8", errors="ignore")
+                    hroot = ET.fromstring(header_xml)
+                    for elem in hroot.iter():
+                        tag = elem.tag.split("}")[-1]
+                        if tag == "style":
+                            sid = elem.attrib.get("id", "")
+                            name = elem.attrib.get("name", "").lower()
+                            # 한글/영문 제목 스타일 인식
+                            if "개요 1" in name or "heading 1" in name or name == "제목 1":
+                                style_to_level[sid] = 1
+                            elif "개요 2" in name or "heading 2" in name or name == "제목 2":
+                                style_to_level[sid] = 2
+                            elif "개요 3" in name or "heading 3" in name or name == "제목 3":
+                                style_to_level[sid] = 3
+                            elif "개요 4" in name or "heading 4" in name:
+                                style_to_level[sid] = 4
+                            elif "개요 5" in name or "heading 5" in name:
+                                style_to_level[sid] = 5
+                            elif name == "제목":
+                                style_to_level[sid] = 1
+                except ET.ParseError:
+                    continue
 
+            # 본문 파싱
             for xml_name in xml_files:
                 try:
                     with z.open(xml_name) as f:
                         content = f.read().decode("utf-8", errors="ignore")
                     root = ET.fromstring(content)
 
-                    # 모든 텍스트 요소 추출
                     for elem in root.iter():
-                        tag = elem.tag.split("}")[-1]  # 네임스페이스 제거
-                        # t 태그 = 텍스트
-                        if tag == "t" and elem.text:
-                            lines.append(elem.text)
-                        # p 태그 끝날 때 줄바꿈
-                        elif tag == "p":
-                            lines.append("")
+                        tag = elem.tag.split("}")[-1]
+                        if tag == "p":  # 문단
+                            style_id = elem.attrib.get("paraPrIDRef", "")
+                            level = style_to_level.get(style_id, 0)
+
+                            # 문단 안의 모든 텍스트 합치기
+                            para_text = ""
+                            for sub in elem.iter():
+                                sub_tag = sub.tag.split("}")[-1]
+                                if sub_tag == "t" and sub.text:
+                                    para_text += sub.text
+
+                            para_text = para_text.strip()
+                            if para_text:
+                                paragraphs.append((level, para_text))
+                            else:
+                                paragraphs.append((0, ""))  # 빈 줄
                 except ET.ParseError:
                     continue
     except zipfile.BadZipFile:
         raise ValueError("올바른 HWPX 파일이 아닙니다.")
 
-    # 문단 단위 정리
-    text = "\n".join(lines)
-    # 연속 빈 줄 정리
-    text = re.sub(r'\n{3,}', '\n\n', text)
-
-    # 기본 Markdown 구조화 (짧은 줄은 제목 후보)
-    result = []
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            result.append("")
+    # 마크다운 조립
+    lines = []
+    for level, text in paragraphs:
+        if not text:
+            lines.append("")
             continue
-        if len(stripped) < 30 and not stripped.endswith((".", ",", "?", "!", ":")):
-            result.append(f"## {stripped}")
+        if level >= 1 and level <= 6:
+            lines.append(f"{'#' * level} {text}")
         else:
-            result.append(stripped)
+            # 스타일 정보 없는 경우에만 휴리스틱 적용 (최후 수단)
+            lines.append(text)
 
-    return "\n".join(result)
+    return "\n".join(lines)
 
 
 def text_to_md(text: str) -> str:
@@ -215,6 +243,16 @@ class MDConverterApp(tk.Tk):
 
         self._build_file_tab(self.tab_file)
         self._build_text_tab(self.tab_text)
+
+        # 하단 저작권 표시
+        footer = tk.Frame(self, bg=DARK_BG)
+        footer.pack(side="bottom", fill="x", pady=(0, 8))
+        tk.Label(
+            footer,
+            text="© Renai. All rights reserved.  ·  Moonlight Archive",
+            font=("Helvetica Neue", 10),
+            fg=TEXT_DIM, bg=DARK_BG
+        ).pack()
 
     def _style_notebook(self):
         s = ttk.Style(self)
