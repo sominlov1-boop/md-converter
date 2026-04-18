@@ -1,6 +1,6 @@
 """
 MD Converter — macOS App
-DOCX / PDF / Text → Markdown
+DOCX / PDF / HWPX / Text → Markdown
 """
 
 import tkinter as tk
@@ -8,13 +8,14 @@ from tkinter import ttk, filedialog, messagebox
 import threading
 import os
 import re
+import zipfile
+import xml.etree.ElementTree as ET
 
 # ── 변환 로직 ──────────────────────────────────────────────
 
 def docx_to_md(path: str) -> str:
     try:
         from docx import Document
-        from docx.oxml.ns import qn
     except ImportError:
         raise ImportError("python-docx가 설치되어 있지 않습니다.")
 
@@ -37,7 +38,6 @@ def docx_to_md(path: str) -> str:
         elif style.startswith("List"):
             lines.append(f"- {text}")
         else:
-            # 인라인 서식 처리
             md_text = ""
             for run in para.runs:
                 t = run.text
@@ -50,7 +50,6 @@ def docx_to_md(path: str) -> str:
                 md_text += t
             lines.append(md_text if md_text.strip() else text)
 
-    # 표 처리
     for table in doc.tables:
         if not table.rows:
             continue
@@ -74,11 +73,10 @@ def pdf_to_md(path: str) -> str:
 
     lines = []
     with pdfplumber.open(path) as pdf:
-        for i, page in enumerate(pdf.pages):
+        for page in pdf.pages:
             text = page.extract_text()
             if text:
                 lines.append(text)
-            # 표 추출
             for table in page.extract_tables():
                 if not table:
                     continue
@@ -94,8 +92,65 @@ def pdf_to_md(path: str) -> str:
     return "\n".join(lines)
 
 
+def hwpx_to_md(path: str) -> str:
+    """HWPX는 ZIP 컨테이너 안에 XML이 들어있는 구조"""
+    lines = []
+    try:
+        with zipfile.ZipFile(path, 'r') as z:
+            # 본문 XML 파일들 찾기 (Contents/section*.xml)
+            xml_files = sorted([n for n in z.namelist()
+                                if n.startswith("Contents/section") and n.endswith(".xml")])
+            if not xml_files:
+                # 다른 구조일 경우 모든 xml 시도
+                xml_files = [n for n in z.namelist() if n.endswith(".xml")]
+
+            # HWPX 네임스페이스
+            ns = {
+                "hp": "http://www.hancom.co.kr/hwpml/2011/paragraph",
+                "hs": "http://www.hancom.co.kr/hwpml/2011/section",
+            }
+
+            for xml_name in xml_files:
+                try:
+                    with z.open(xml_name) as f:
+                        content = f.read().decode("utf-8", errors="ignore")
+                    root = ET.fromstring(content)
+
+                    # 모든 텍스트 요소 추출
+                    for elem in root.iter():
+                        tag = elem.tag.split("}")[-1]  # 네임스페이스 제거
+                        # t 태그 = 텍스트
+                        if tag == "t" and elem.text:
+                            lines.append(elem.text)
+                        # p 태그 끝날 때 줄바꿈
+                        elif tag == "p":
+                            lines.append("")
+                except ET.ParseError:
+                    continue
+    except zipfile.BadZipFile:
+        raise ValueError("올바른 HWPX 파일이 아닙니다.")
+
+    # 문단 단위 정리
+    text = "\n".join(lines)
+    # 연속 빈 줄 정리
+    text = re.sub(r'\n{3,}', '\n\n', text)
+
+    # 기본 Markdown 구조화 (짧은 줄은 제목 후보)
+    result = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            result.append("")
+            continue
+        if len(stripped) < 30 and not stripped.endswith((".", ",", "?", "!", ":")):
+            result.append(f"## {stripped}")
+        else:
+            result.append(stripped)
+
+    return "\n".join(result)
+
+
 def text_to_md(text: str) -> str:
-    """기본 텍스트 → Markdown 휴리스틱 변환"""
     lines = text.splitlines()
     result = []
     for line in lines:
@@ -103,7 +158,6 @@ def text_to_md(text: str) -> str:
         if not stripped:
             result.append("")
             continue
-        # 짧고 끝에 마침표 없으면 제목 후보
         if len(stripped) < 40 and not stripped.endswith((".", ",", "?", "!")):
             result.append(f"## {stripped}")
         else:
@@ -112,7 +166,6 @@ def text_to_md(text: str) -> str:
 
 
 def clean_markdown(md: str) -> str:
-    """빈 줄 3개 이상 → 2개로 정리"""
     md = re.sub(r'\n{3,}', '\n\n', md)
     return md.strip()
 
@@ -126,10 +179,6 @@ ACCENT    = "#7eceff"
 TEXT_MAIN = "#e8e8e8"
 TEXT_DIM  = "#888888"
 GREEN     = "#5ddb8e"
-RED_ERR   = "#ff6b6b"
-
-FONT_MONO = ("JetBrains Mono", 12) if os.path.exists("/Library/Fonts/JetBrainsMono-Regular.ttf") else ("Menlo", 12)
-FONT_UI   = ("SF Pro Display", 13) if os.system("fc-list | grep 'SF Pro' > /dev/null 2>&1") == 0 else ("Helvetica Neue", 13)
 
 
 class MDConverterApp(tk.Tk):
@@ -140,24 +189,22 @@ class MDConverterApp(tk.Tk):
         self.minsize(760, 560)
         self.configure(bg=DARK_BG)
         self._result_md = ""
+        self._txt_result_md = ""
         self._build_ui()
         self._check_deps()
 
     def _build_ui(self):
-        # ── 헤더
         hdr = tk.Frame(self, bg=DARK_BG, pady=16)
         hdr.pack(fill="x", padx=28)
         tk.Label(hdr, text="MD Converter", font=("Helvetica Neue", 22, "bold"),
                  fg=ACCENT, bg=DARK_BG).pack(side="left")
-        tk.Label(hdr, text="DOCX · PDF · Text  →  Markdown",
+        tk.Label(hdr, text="DOCX · PDF · HWPX · Text  →  Markdown",
                  font=("Helvetica Neue", 12), fg=TEXT_DIM, bg=DARK_BG).pack(side="left", padx=14, pady=4)
 
-        # ── 구분선
         tk.Frame(self, bg=BORDER, height=1).pack(fill="x")
 
-        # ── 탭
         nb = ttk.Notebook(self)
-        nb.pack(fill="both", expand=True, padx=0, pady=0)
+        nb.pack(fill="both", expand=True)
 
         self._style_notebook()
 
@@ -181,33 +228,27 @@ class MDConverterApp(tk.Tk):
               background=[("selected", DARK_BG)],
               foreground=[("selected", ACCENT)])
 
-    # ── 파일 탭 ─────────────────────────────────────────────
-
     def _build_file_tab(self, parent):
-        # 드롭존
         drop_frame = tk.Frame(parent, bg=PANEL_BG, bd=0, relief="flat",
                               highlightbackground=BORDER, highlightthickness=1)
         drop_frame.pack(fill="x", padx=28, pady=(20, 0))
 
         self.drop_label = tk.Label(
             drop_frame,
-            text="📂  파일을 드래그하거나 클릭하여 선택\n\n.docx   .pdf",
+            text="📂  파일을 클릭하여 선택\n\n.docx   .pdf   .hwpx",
             font=("Helvetica Neue", 14), fg=TEXT_DIM, bg=PANEL_BG,
             pady=32, cursor="hand2"
         )
         self.drop_label.pack(fill="x")
         self.drop_label.bind("<Button-1>", lambda e: self._pick_file())
 
-        # 파일명 표시
         self.file_info = tk.Label(parent, text="", font=("Menlo", 11),
                                   fg=ACCENT, bg=DARK_BG)
         self.file_info.pack(pady=(8, 0))
 
-        # 변환 버튼
         self.btn_convert = self._btn(parent, "변환하기", self._convert_file)
         self.btn_convert.pack(pady=(12, 0))
 
-        # 결과
         self._build_result_area(parent)
 
     def _build_text_tab(self, parent):
@@ -254,8 +295,6 @@ class MDConverterApp(tk.Tk):
         else:
             self._file_result_box = box
 
-    # ── 위젯 팩토리 ──────────────────────────────────────────
-
     def _btn(self, parent, text, cmd):
         return tk.Button(
             parent, text=text, command=cmd,
@@ -272,11 +311,14 @@ class MDConverterApp(tk.Tk):
             activebackground="#444", activeforeground=TEXT_MAIN
         )
 
-    # ── 이벤트 ───────────────────────────────────────────────
-
     def _pick_file(self):
         path = filedialog.askopenfilename(
-            filetypes=[("지원 파일", "*.docx *.pdf"), ("DOCX", "*.docx"), ("PDF", "*.pdf")]
+            filetypes=[
+                ("지원 파일", "*.docx *.pdf *.hwpx"),
+                ("DOCX", "*.docx"),
+                ("PDF", "*.pdf"),
+                ("HWPX", "*.hwpx"),
+            ]
         )
         if path:
             self._selected_file = path
@@ -296,6 +338,8 @@ class MDConverterApp(tk.Tk):
                 md = docx_to_md(path)
             elif ext == ".pdf":
                 md = pdf_to_md(path)
+            elif ext == ".hwpx":
+                md = hwpx_to_md(path)
             else:
                 raise ValueError(f"지원하지 않는 형식: {ext}")
             md = clean_markdown(md)
@@ -329,7 +373,7 @@ class MDConverterApp(tk.Tk):
         self.after(0, _update)
 
     def _copy(self, prefix):
-        md = getattr(self, "_txt_result_md" if prefix == "txt" else "_result_md", "")
+        md = self._txt_result_md if prefix == "txt" else self._result_md
         if not md:
             messagebox.showinfo("없음", "변환 결과가 없습니다.")
             return
@@ -338,7 +382,7 @@ class MDConverterApp(tk.Tk):
         messagebox.showinfo("복사 완료", "클립보드에 복사되었습니다.")
 
     def _save(self, prefix):
-        md = getattr(self, "_txt_result_md" if prefix == "txt" else "_result_md", "")
+        md = self._txt_result_md if prefix == "txt" else self._result_md
         if not md:
             messagebox.showinfo("없음", "변환 결과가 없습니다.")
             return
